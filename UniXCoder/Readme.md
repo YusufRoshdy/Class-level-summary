@@ -9,6 +9,7 @@ python preprocess.py --datafile ../classes-cleaned-dedup.jsonl
 This cmmand will also creat `expirament.jsonl` with 100 sampels to be used for debugging
 
 ## Fine-Tune Setting
+Adjust the paramenters based on your resources
 
 ```sh
 # Training
@@ -48,8 +49,10 @@ to make sure that everything is working propererly, you can try to run with the 
 # experiment
 python run.py \
 	--do_train \
+    --do_eval \
 	--model_name_or_path microsoft/unixcoder-base-nine \
 	--train_filename experiment.jsonl \
+	--dev_filename  experiment.jsonl \
 	--output_dir saved_models \
 	--max_source_length 768 \
 	--max_target_length 256 \
