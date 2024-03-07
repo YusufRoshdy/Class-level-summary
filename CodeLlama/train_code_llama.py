@@ -93,7 +93,7 @@ def parse_args():
     return args
 
 
-# Load your custom dataset
+# Load custom dataset
 train_dataset = load_dataset("json", data_files="train.jsonl", split="train")
 val_dataset = load_dataset("json", data_files="val.jsonl", split="train")
 
