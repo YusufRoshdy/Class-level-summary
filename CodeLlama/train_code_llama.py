@@ -1,8 +1,8 @@
+import argparse
 from datetime import datetime
-import os
 import sys
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -15,18 +15,213 @@ from peft import (
     get_peft_model,
     get_peft_model_state_dict,
     prepare_model_for_int8_training,
-    set_peft_model_state_dict,
 )
+
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+
+
+class FineTuner:
+    def __init__(self, args):
+        self.args = args
+        self.tokenizer = None
+        self.model = None
+
+    def load_datasets(self):
+        train_dataset = load_dataset("json", data_files=self.args.train_filename)[
+            "train"
+        ]
+        val_dataset = load_dataset("json", data_files=self.args.val_filename)["train"]
+
+        # Since both datasets are loaded with the 'train' split, create a new DatasetDict to organize them
+        datasets = DatasetDict(
+            {
+                "train": train_dataset,
+                "validation": val_dataset,  # Now, you manually set the validation split
+            }
+        )
+
+        print("Train dataset:", datasets["train"])
+        print("Val dataset:", datasets["validation"])
+
+        return datasets["train"], datasets["validation"]
+
+    def tokenize_function(self, examples):
+        tokenized_inputs = self.tokenizer(
+            examples["class"],
+            padding="max_length",
+            # padding=False,
+            truncation=True,
+            max_length=self.args.max_source_length,
+            return_tensors="pt",
+        )
+        print(examples["docstring"][:2])
+        tokenized_outputs = self.tokenizer(
+            examples["docstring"],
+            padding="max_length",
+            # padding=False,
+            truncation=True,
+            max_length=self.args.max_target_length,
+            return_tensors="pt",
+            # text_target=True,
+        )
+        tokenized_inputs["labels"] = tokenized_outputs["input_ids"]
+        print(len(tokenized_inputs["input_ids"]), len(tokenized_inputs["labels"]))
+        return tokenized_inputs
+
+    def tokenize_datasets(self, train_dataset, val_dataset):
+        tokenized_train_dataset = train_dataset.map(
+            self.tokenize_function, batched=True
+        )
+        tokenized_val_dataset = val_dataset.map(self.tokenize_function, batched=True)
+        return tokenized_train_dataset, tokenized_val_dataset
+
+    def initialize_model_and_tokenizer(self):
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.args.model_name_or_path,
+            load_in_8bit=True,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_name_or_path)
+        self.tokenizer.pad_token = (
+            self.tokenizer.eos_token
+        )  # Set pad token to eos token
+
+        # Prepare model for INT8 training and apply PEFT
+        self.model.train()
+        self.model = prepare_model_for_int8_training(self.model)
+
+        config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        self.model = get_peft_model(self.model, config)
+
+        # Disable caching for PEFT model
+        self.model.config.use_cache = False
+        old_state_dict = self.model.state_dict
+        self.model.state_dict = lambda *_, **__: get_peft_model_state_dict(
+            self.model, old_state_dict()
+        ).__get__(self.model, type(self.model))
+
+    def setup_training(self, tokenized_train_dataset, tokenized_val_dataset):
+        training_args = TrainingArguments(
+            per_device_train_batch_size=self.args.train_batch_size,
+            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+            num_train_epochs=self.args.num_train_epochs,
+            warmup_steps=100,
+            learning_rate=self.args.learning_rate,
+            logging_dir="./logs",
+            logging_steps=50,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            output_dir=self.args.output_dir,
+            optim="adamw_torch",
+            fp16=True,
+        )
+
+        data_collator = DataCollatorForSeq2Seq(self.tokenizer, model=self.model)
+
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=tokenized_train_dataset,
+            eval_dataset=tokenized_val_dataset,
+            data_collator=data_collator,
+        )
+
+        return trainer
+
+    def train(self):
+        train_dataset, val_dataset = self.load_datasets()
+        self.initialize_model_and_tokenizer()
+        tokenized_train_dataset, tokenized_val_dataset = self.tokenize_datasets(
+            train_dataset, val_dataset
+        )
+        trainer = self.setup_training(tokenized_train_dataset, tokenized_val_dataset)
+        trainer.train()
+
+    def debug_train(self):
+        # Load and prepare datasets
+        train_dataset, val_dataset = self.load_datasets()
+        self.initialize_model_and_tokenizer()
+        tokenized_train_dataset, tokenized_val_dataset = self.tokenize_datasets(
+            train_dataset, val_dataset
+        )
+
+        # Convert datasets to PyTorch DataLoader
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer=self.tokenizer, model=self.model, return_tensors="pt"
+        )
+        train_dataloader = DataLoader(
+            tokenized_train_dataset,
+            batch_size=self.args.train_batch_size,
+            shuffle=True,
+            collate_fn=data_collator,
+        )
+
+        val_dataloader = DataLoader(
+            tokenized_val_dataset,
+            batch_size=self.args.train_batch_size,
+            collate_fn=data_collator,
+        )
+
+        # Prepare optimizer
+        optimizer = AdamW(self.model.parameters(), lr=self.args.learning_rate)
+
+        # Move model to the appropriate device (GPU or CPU)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device)
+
+        # print dataloader
+        print(f"Train dataloader: {train_dataloader}")
+
+        # print the first batch
+        print(f"First batch: {train_dataloader[0]}")
+
+        # Training loop
+        # self.model.train()
+        # for batch in train_dataloader:
+        #     print(f"Batch {batch}")
+        #     optimizer.zero_grad()
+
+        #     input_ids = batch["input_ids"].to(device)
+        #     attention_mask = batch["attention_mask"].to(device)
+        #     labels = batch["labels"].to(device)
+
+        #     outputs = self.model(
+        #         input_ids=input_ids, attention_mask=attention_mask, labels=labels
+        #     )
+
+        #     # Debugging: Print shapes to understand the mismatch
+        #     print(f"Input IDs shape: {input_ids.shape}")
+        #     print(f"Attention Mask shape: {attention_mask.shape}")
+        #     print(f"Labels shape: {labels.shape}")
+        #     print(f"Outputs shape: {outputs.logits.shape}")
+
+        #     loss = outputs.loss
+        #     print(f"Loss: {loss}")
+
+        #     loss.backward()
+        #     optimizer.step()
+
+        #     break
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-
     parser.add_argument(
         "--do_train", action="store_true", help="Whether to run training."
     )
     parser.add_argument(
-        "--do_eval", action="store_true", help="Whether to run eval on the dev set."
+        "--do_eval",
+        action="store_true",
+        help="Whether to run eval on the validation set.",
     )
     parser.add_argument(
         "--model_name_or_path",
@@ -41,10 +236,10 @@ def parse_args():
         help="The input training data file (a jsonl file).",
     )
     parser.add_argument(
-        "--dev_filename",
+        "--val_filename",
         type=str,
         required=True,
-        help="The input development data file (a jsonl file).",
+        help="The input validation data file (a jsonl file).",
     )
     parser.add_argument(
         "--output_dir",
@@ -85,121 +280,19 @@ def parse_args():
     parser.add_argument(
         "--num_train_epochs",
         type=int,
-        default=10,
+        default=3,
         help="Total number of training epochs to perform.",
     )
-
-    args = parser.parse_args()
-    return args
+    return parser.parse_args()
 
 
-# Load custom dataset
-train_dataset = load_dataset("json", data_files="train.jsonl", split="train")
-val_dataset = load_dataset("json", data_files="val.jsonl", split="train")
-
-# Initialize model and tokenizer
-base_model = "codellama/CodeLlama-7b-hf"
-model = AutoModelForCausalLM.from_pretrained(
-    base_model,
-    load_in_8bit=True,
-    torch_dtype=torch.float16,
-    device_map="auto",
-)
-tokenizer = AutoTokenizer.from_pretrained(base_model)
-
-# Ensure correct tokenizer configuration
-tokenizer.add_eos_token = True
-tokenizer.pad_token_id = 0
-tokenizer.padding_side = "left"
+def main():
+    args = parse_args()
+    fine_tuner = FineTuner(args)
+    if args.do_train:
+        # fine_tuner.train()
+        fine_tuner.debug_train()
 
 
-def tokenize(prompt):
-    result = tokenizer(
-        prompt,
-        truncation=True,
-        max_length=512,
-        padding=False,
-        return_tensors=None,
-    )
-    result["labels"] = result["input_ids"].copy()
-    return result
-
-
-def generate_and_tokenize_prompt(data_point):
-    class_code = data_point["class"]
-    docstring = data_point["docstring"]
-    full_prompt = f"""### Python class code:
-{class_code}
-
-### Docstring:
-{docstring}
-"""
-    return tokenize(full_prompt)
-
-
-# Tokenize datasets
-tokenized_train_dataset = train_dataset.map(generate_and_tokenize_prompt, batched=True)
-tokenized_val_dataset = val_dataset.map(generate_and_tokenize_prompt, batched=True)
-
-# Prepare model for INT8 training and apply PEFT
-model.train()
-model = prepare_model_for_int8_training(model)
-
-config = LoraConfig(
-    r=16,
-    lora_alpha=16,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-model = get_peft_model(model, config)
-
-# Configuration for training
-batch_size = 128
-per_device_train_batch_size = 32
-gradient_accumulation_steps = batch_size // per_device_train_batch_size
-output_dir = "code-classification"
-
-training_args = TrainingArguments(
-    per_device_train_batch_size=per_device_train_batch_size,
-    gradient_accumulation_steps=gradient_accumulation_steps,
-    warmup_steps=100,
-    max_steps=400,
-    learning_rate=3e-4,
-    fp16=True,
-    logging_steps=10,
-    optim="adamw_torch",
-    evaluation_strategy="steps",
-    save_strategy="steps",
-    eval_steps=20,
-    save_steps=20,
-    output_dir=output_dir,
-    group_by_length=True,
-    report_to="wandb",
-    run_name=f"codellama-{datetime.now().strftime('%Y-%m-%d-%H-%M')}",
-)
-
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_train_dataset,
-    eval_dataset=tokenized_val_dataset,
-    data_collator=DataCollatorForSeq2Seq(
-        tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-    ),
-)
-
-# Disable caching for PEFT model and prepare for training
-model.config.use_cache = False
-old_state_dict = model.state_dict
-model.state_dict = lambda self, *_, **__: get_peft_model_state_dict(
-    self, old_state_dict()
-).__get__(model, type(model))
-
-if torch.__version__ >= "2" and sys.platform != "win32":
-    print("compiling the model")
-    model = torch.compile(model)
-
-# Start training
-trainer.train()
+if __name__ == "__main__":
+    main()
