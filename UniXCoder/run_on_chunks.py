@@ -100,7 +100,6 @@ def train(args, model, device, tokenizer, writer):
     patience, best_bleu, losses, dev_dataset = 0, 0, [], {}
     for epoch in range(args.num_train_epochs):
         epoch_loss = 0  # For tracking epoch loss
-        steps_count = 0
         
         # Shuffle the chunk order for this epoch
         chunk_order = list(range(num_chunks))
@@ -136,7 +135,6 @@ def train(args, model, device, tokenizer, writer):
                     optimizer.zero_grad()
                     scheduler.step()
                     epoch_loss += loss.item()
-                    steps_count += len(loss.item())
                     if len(losses) // args.gradient_accumulation_steps % 100 == 0:
                         logger.info("epoch {} step {} loss {}".format(epoch,
                                                                       len(losses) // args.gradient_accumulation_steps,
@@ -144,7 +142,7 @@ def train(args, model, device, tokenizer, writer):
                 # print('batch time', time() - st)
 
         # Log epoch loss to TensorBoard
-        # writer.add_scalar('Loss/train', epoch_loss / steps_count), epoch)
+        writer.add_scalar('Loss/train', epoch_loss / len(losses) // args.gradient_accumulation_steps), epoch)
 
         if args.do_eval:
             evaluate(args, model, device, tokenizer, writer, epoch, dev_dataset, best_bleu, patience)
