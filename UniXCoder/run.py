@@ -269,7 +269,8 @@ def main():
         model.train()
         patience, best_bleu, losses, dev_dataset = 0, 0, [], {}
         for epoch in range(args.num_train_epochs):
-            for idx,batch in enumerate(train_dataloader):
+            print(f'{epoch = }:')
+            for idx,batch in tqdm(enumerate(train_dataloader)):
                 batch = tuple(t.to(device) for t in batch)
                 source_ids,target_ids = batch
                 loss,_,_ = model(source_ids=source_ids,target_ids=target_ids)
@@ -300,7 +301,7 @@ def main():
                     all_source_ids = torch.tensor([f.source_ids for f in eval_features], dtype=torch.long)
                     all_target_ids = torch.tensor([f.target_ids for f in eval_features], dtype=torch.long)   
                     eval_data = TensorDataset(all_source_ids,all_target_ids)   
-                    dev_dataset['dev_loss' ]= eval_examples,eval_data
+                    dev_dataset['dev_loss']= eval_examples,eval_data
                 eval_sampler = SequentialSampler(eval_data)
                 eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
